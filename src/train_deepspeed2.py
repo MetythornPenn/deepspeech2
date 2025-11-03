@@ -776,3 +776,126 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+import torch
+import torchaudio
+import pandas as pd
+from pathlib import Path
+from torch import nn
+from typing import Sequence, Iterable, Tuple
+from loguru import logger as LOGGER
+
+
+def load_dataset_tsv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Dataset manifest not found: {path}")
+
+    df = pd.read_csv(path, sep="\t", names=["audio_path", "transcript"], dtype=str)
+    df = df.dropna(subset=["audio_path", "transcript"])
+    df["audio_path"] = df["audio_path"].map(lambda p: Path(p).expanduser().resolve())
+    df["transcript"] = df["transcript"].map(normalize_khmer)
+
+    df = df[(df["audio_path"] != "") & (df["transcript"] != "")]
+
+    exists_mask = df["audio_path"].map(Path.exists)
+    missing = int((~exists_mask).sum())
+    if missing:
+        LOGGER.warning("Skipping %d rows with missing audio files", missing)
+    return df.loc[exists_mask].reset_index(drop=True)
+
+
+def build_vocab(texts: Iterable[str], ignored_chars: Sequence[str]) -> list[str]:
+    ignored = set(ignored_chars)
+    symbols: set[str] = set()
+    for text in texts:
+        symbols.update(ch for ch in text if ch not in ignored)
+
+    vocab = ["<pad>", "<blank>", *sorted(symbols)]
+    LOGGER.info("Vocab built with %d symbols (ignored %d characters)", len(vocab), len(ignored))
+    return vocab
+
+
+class ASRDataset(torch.utils.data.Dataset):
+    def __init__(self, df: pd.DataFrame, vocab: Sequence[str], sr: int, n_mels: int = 80) -> None:
+        """
+        Dataset that loads audio and converts it to log-Mel spectrograms,
+        while tokenizing transcripts using your own vocab.
+        """
+        self.df = df.reset_index(drop=True)
+        self.sample_rate = sr
+        self.n_mels = n_mels
+
+        # char-to-index mapping
+        self.char_to_idx = {c: i for i, c in enumerate(vocab)}
+        self.allowed_chars = {c for c in vocab if c not in {"<pad>", "<blank>"}}
+
+        # Mel-spectrogram extractor
+        self.mel_extractor = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sr,
+            n_fft=1024,
+            hop_length=256,
+            n_mels=n_mels,
+            power=2.0,
+            center=False,
+        )
+        self.to_db = torchaudio.transforms.AmplitudeToDB(stype="power")
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        row = self.df.iloc[idx]
+        path: Path = row["audio_path"]
+        text: str = row["transcript"]
+
+        # ---- Load audio ----
+        waveform, sr = torchaudio.load(path)
+        if waveform.size(0) > 1:
+            waveform = waveform.mean(dim=0)
+        else:
+            waveform = waveform.squeeze(0)
+
+        if sr != self.sample_rate:
+            waveform = torchaudio.functional.resample(waveform, sr, self.sample_rate)
+
+        waveform = waveform.clamp(-1.0, 1.0)
+
+        # ---- Convert to log-mel spectrogram ----
+        mel = self.mel_extractor(waveform)
+        mel_db = self.to_db(mel)
+        mel_db = (mel_db - mel_db.mean()) / (mel_db.std() + 1e-6)
+        mel_db = mel_db.transpose(0, 1)  # (time, n_mels)
+
+        # ---- Tokenize transcript using vocab ----
+        filtered = "".join(c for c in text if c in self.allowed_chars)
+        if not filtered:
+            raise ValueError(f"Transcript at index {idx} has no supported characters: {text!r}")
+        label_ids = torch.tensor([self.char_to_idx[c] for c in filtered], dtype=torch.long)
+
+        return mel_db, label_ids
+
+
+def pad_spectrograms(batch: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    lengths = torch.tensor([spec.size(0) for spec in batch], dtype=torch.long)
+    max_len = int(lengths.max())
+    n_mels = batch[0].size(1)
+
+    padded = torch.zeros(len(batch), max_len, n_mels)
+    for i, spec in enumerate(batch):
+        padded[i, : spec.size(0)] = spec
+    return padded, lengths
+
+
+def collate_batch(batch: Sequence[Tuple[torch.Tensor, torch.Tensor]]):
+    specs, labels = zip(*batch)
+
+    padded_specs, spec_lengths = pad_spectrograms(specs)
+    label_lengths = torch.tensor([len(l) for l in labels], dtype=torch.long)
+    max_label_len = int(label_lengths.max())
+
+    padded_labels = torch.zeros(len(labels), max_label_len, dtype=torch.long)
+    for i, l in enumerate(labels):
+        padded_labels[i, : len(l)] = l
+
+    return padded_specs, spec_lengths, padded_labels, label_lengths
